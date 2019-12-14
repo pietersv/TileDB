@@ -129,19 +129,34 @@ ResultTile::TilePair* ResultTile::tile_pair(const std::string& name) {
 }
 
 const void* ResultTile::coord(uint64_t pos, unsigned dim_idx) const {
+  //std::cerr << "JOE ResultTile::coord pos " << pos << std::endl;
+  //std::cerr << "JOE ResultTile::coord dim_idx " << dim_idx << std::endl;
+
   // Handle separate coordinate tiles
   const auto& coord_tile = coord_tiles_[dim_idx].second.first;
   if (!coord_tile.empty()) {
-    auto coord_buff = (const unsigned char*)coord_tile.internal_data();
-    return &coord_buff[pos * coord_tile.cell_size()];
+    const uint64_t offset = pos * coord_tile.cell_size();
+    //std::cerr << "JOE ResultTile::coord offset 1: " << offset << std::endl;
+    //std::cerr << "JOE coord_tile.chunked_buffer() " << coord_tile.chunked_buffer() << std::endl;
+    void *buffer = nullptr;
+    const Status st =
+      coord_tile.chunked_buffer()->internal_buffer_from_offset(offset, &buffer);
+    assert(st.ok());
+    return buffer;
   }
 
   // Handle zipped coordinates tile
   if (!coords_tile_.first.empty()) {
     auto coords_size = coords_tile_.first.cell_size();
     auto coord_size = coords_size / coords_tile_.first.dim_num();
-    auto coords_buff = (const unsigned char*)coords_tile_.first.internal_data();
-    return &coords_buff[pos * coords_size + dim_idx * coord_size];
+    const uint64_t offset = pos * coords_size + dim_idx * coord_size;
+    //std::cerr << "JOE ResultTile::coord offset 2: " << offset << std::endl;
+    //std::cerr << "JOE coords_tile_.first.chunked_buffer() " << coord_tile.chunked_buffer() << std::endl;
+    void *buffer = nullptr;
+    const Status st =
+      coords_tile_.first.chunked_buffer()->internal_buffer_from_offset(offset, &buffer);
+    assert(st.ok());
+    return buffer;
   }
 
   return nullptr;

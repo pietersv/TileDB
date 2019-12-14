@@ -261,11 +261,13 @@ SparseArrayFx::SparseArrayFx() {
 
   std::srand(0);
 
+  #if 0
   create_temp_dir(FILE_URI_PREFIX + FILE_TEMP_DIR);
   if (supports_s3_)
     create_temp_dir(S3_TEMP_DIR);
   if (supports_hdfs_)
     create_temp_dir(HDFS_TEMP_DIR);
+  #endif
 }
 
 SparseArrayFx::~SparseArrayFx() {
@@ -322,10 +324,13 @@ void SparseArrayFx::create_temp_dir(const std::string& path) {
 }
 
 void SparseArrayFx::remove_temp_dir(const std::string& path) {
+  if (path.empty()) {}
+  #if 0
   int is_dir = 0;
   REQUIRE(tiledb_vfs_is_dir(ctx_, vfs_, path.c_str(), &is_dir) == TILEDB_OK);
   if (is_dir)
     REQUIRE(tiledb_vfs_remove_dir(ctx_, vfs_, path.c_str()) == TILEDB_OK);
+  #endif
 }
 
 std::string SparseArrayFx::random_bucket_name(const std::string& prefix) {
@@ -461,6 +466,7 @@ int* SparseArrayFx::read_sparse_array_2D(
 
   CHECK(rc == TILEDB_OK);
   auto buffer = new int[buffer_size / sizeof(int)];
+  memset(buffer, 0, buffer_size);
   REQUIRE(buffer != nullptr);
 
   // Create query
@@ -482,6 +488,7 @@ int* SparseArrayFx::read_sparse_array_2D(
   REQUIRE(rc == TILEDB_OK);
 
   // Submit query
+  std::cerr << "JOE submitting query" << std::endl;
   rc = tiledb_query_submit(ctx_, query);
   REQUIRE(rc == TILEDB_OK);
 
@@ -682,6 +689,7 @@ void SparseArrayFx::write_sparse_array_unsorted_2D(
   // Open array
   tiledb_array_t* array;
   int rc = tiledb_array_alloc(ctx_, array_name.c_str(), &array);
+  std::cerr << "JOE writing array " << array_name << std::endl;
   CHECK(rc == TILEDB_OK);
   if (encryption_type == TILEDB_NO_ENCRYPTION) {
     rc = tiledb_array_open(ctx_, array, TILEDB_WRITE);
@@ -737,7 +745,7 @@ void SparseArrayFx::test_random_subarrays(
     int64_t domain_size_1,
     int iter_num) {
   // write array_schema cells with value = row id * columns + col id to disk
-  write_sparse_array_unsorted_2D(array_name, domain_size_0, domain_size_1);
+  //write_sparse_array_unsorted_2D(array_name, domain_size_0, domain_size_1);
 
   // test random subarrays and check with corresponding value set by
   // row_id*dim1+col_id. top left corner is always 4,4.
@@ -748,8 +756,8 @@ void SparseArrayFx::test_random_subarrays(
   int64_t height = 0, width = 0;
 
   for (int iter = 0; iter < iter_num; ++iter) {
-    height = rand() % (domain_size_0 - d0_lo);
-    width = rand() % (domain_size_1 - d1_lo);
+    height = 234243 % (domain_size_0 - d0_lo);
+    width = 65723 % (domain_size_1 - d1_lo);
     d0_hi = d0_lo + height;
     d1_hi = d1_lo + width;
     int64_t index = 0;
@@ -759,15 +767,22 @@ void SparseArrayFx::test_random_subarrays(
         array_name, d0_lo, d0_hi, d1_lo, d1_hi, TILEDB_READ, TILEDB_ROW_MAJOR);
     CHECK(buffer != NULL);
 
+    std::cerr << "JOE d0_lo " << d0_lo << std::endl;
+    std::cerr << "JOE d0_hi " << d0_hi << std::endl;
+    std::cerr << "JOE d1_lo " << d1_lo << std::endl;
+    std::cerr << "JOE d1_hi " << d1_hi << std::endl;
+
     // check
     bool allok = true;
     for (int64_t i = d0_lo; i <= d0_hi; ++i) {
       for (int64_t j = d1_lo; j <= d1_hi; ++j) {
         bool match = buffer[index] == i * domain_size_1 + j;
+        //std::cerr << "JOE " << i << "," << j << " expected: " << ((i * domain_size_1 + j)) << std::endl;
         if (!match) {
           allok = false;
-          std::cout << "mismatch: " << i << "," << j << "=" << buffer[index]
-                    << "!=" << ((i * domain_size_1 + j)) << "\n";
+          std::cerr << "mismatch: " << i << "," << j << "=" << buffer[index]
+                    << "!=" << ((i * domain_size_1 + j)) << "\n"
+                    << " index: " << index << std::endl;
           break;
         }
         ++index;
@@ -777,7 +792,7 @@ void SparseArrayFx::test_random_subarrays(
     }
     // clean up
     delete[] buffer;
-    CHECK(allok);
+    REQUIRE(allok);
   }
 }
 
@@ -786,9 +801,14 @@ void SparseArrayFx::check_sorted_reads(
     tiledb_filter_type_t compressor,
     tiledb_layout_t tile_order,
     tiledb_layout_t cell_order) {
+
+  // JOE TODO RM
+  if (tile_order || cell_order) { }
+
   // Parameters used in this test
   int64_t domain_size_0 = 5000;
   int64_t domain_size_1 = 1000;
+  #if 0
   int64_t tile_extent_0 = 100;
   int64_t tile_extent_1 = 100;
   int64_t domain_0_lo = 0;
@@ -796,8 +816,9 @@ void SparseArrayFx::check_sorted_reads(
   int64_t domain_1_lo = 0;
   int64_t domain_1_hi = domain_size_1 - 1;
   int64_t capacity = 100000;
+  #endif
   int iter_num = (compressor != TILEDB_FILTER_BZIP2) ? ITER_NUM : 1;
-
+  #if 0
   create_sparse_array_2D(
       array_name,
       tile_extent_0,
@@ -810,6 +831,7 @@ void SparseArrayFx::check_sorted_reads(
       compressor,
       tile_order,
       cell_order);
+  #endif
   test_random_subarrays(array_name, domain_size_0, domain_size_1, iter_num);
 }
 

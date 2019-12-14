@@ -52,6 +52,9 @@ class RowCmp {
   RowCmp(const Domain* domain)
       : domain_(domain)
       , dim_num_(domain->dim_num()) {
+
+    //std::cerr << "JOE RowCmp dim_num_ " << dim_num_ << std::endl;
+    //std::cerr << "JOE RowCmp ************** " << std::endl;
   }
 
   /**
@@ -63,6 +66,9 @@ class RowCmp {
    */
   bool operator()(const ResultCoords& a, const ResultCoords& b) const {
     for (unsigned int d = 0; d < dim_num_; ++d) {
+      //std::cerr << "JOE a.coord(d) " << a.coord(d) << std::endl;
+      //std::cerr << "JOE b.coord(d) " << b.coord(d) << std::endl;
+
       auto res = domain_->cell_order_cmp(d, a.coord(d), b.coord(d));
 
       if (res == -1)

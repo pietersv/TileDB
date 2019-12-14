@@ -1010,27 +1010,19 @@ Status Writer::compute_coords_metadata(
   // Compute MBRs
   auto statuses = parallel_for(0, tile_num, [&](uint64_t t) {
     std::vector<T> mbr(2 * dim_num);
-    std::vector<T*> data(dim_num);
+    std::vector<ChunkedBuffer*> chunked_data(dim_num);
     uint64_t cell_num = UINT64_MAX;
     for (unsigned d = 0; d < dim_num; ++d) {
       const auto& dim_name = array_schema_->dimension(d)->name();
       auto tiles_it = tiles.find(dim_name);
-      assert(tiles_it != tiles.end());
-      data[d] = (T*)(tiles_it->second[t].internal_data());
-      assert(
-          cell_num == UINT64_MAX || cell_num == tiles_it->second[t].cell_num());
+      chunked_data[d] = (tiles_it->second[t].chunked_buffer());
+      assert( 
+          cell_num == UINT64_MAX || cell_num == tiles_it->second[t].cell_num());  
       cell_num = tiles_it->second[t].cell_num();
-
-      // Initialize MBR with the first coords
-      mbr[2 * d] = data[d][0];
-      mbr[2 * d + 1] = data[d][0];
     }
 
-    // Expand the MBR with the rest coords
-    assert(cell_num > 0);
-    for (uint64_t c = 1; c < cell_num; ++c)
-      utils::geometry::expand_mbr<T>(data, c, &mbr[0]);
-
+    // Expand the MBR with the rest coords.
+    RETURN_NOT_OK(expand_mbr(chunked_data, cell_num, &mbr[0]));
     meta->set_mbr(t, &mbr[0]);
     return Status::Ok();
   });
@@ -1043,6 +1035,66 @@ Status Writer::compute_coords_metadata(
   const auto& dim_name = array_schema_->dimension(0)->name();
   uint64_t last_tile_cell_num = tiles.find(dim_name)->second.back().cell_num();
   meta->set_last_tile_cell_num(last_tile_cell_num);
+
+  return Status::Ok();
+}
+
+template <class T>
+Status Writer::expand_mbr(
+    const std::vector<ChunkedBuffer*>& coords,
+    const uint64_t cell_num,
+    T* const mbr) const {
+  if (cell_num == 0) {
+    return Status::Ok();
+  }
+
+  const size_t dim_num = coords.size();
+  for (size_t d = 0; d < dim_num; ++d) {
+    ChunkedBuffer* const chunked_buffer = coords[d];
+
+    size_t chunk_idx = 0;
+    size_t chunk_offset = 0;
+
+    // Fetch the first internal buffer.
+    void* buffer;
+    RETURN_NOT_OK(chunked_buffer->internal_buffer(chunk_idx, &buffer));
+
+    for (uint64_t pos = 0; pos < cell_num; ++pos) {
+      // Move to the next internal chunk buffer if the offset exceeds the
+      // current chunk buffer's size.
+      uint32_t chunk_size;
+      RETURN_NOT_OK(
+          chunked_buffer->internal_buffer_size(chunk_idx, &chunk_size));
+      if (chunk_offset >= chunk_size) {
+        ++chunk_idx;
+        chunk_offset = 0;
+
+        // Fetch the next internal buffer and its associated size.
+        RETURN_NOT_OK(chunked_buffer->internal_buffer(chunk_idx, &buffer));
+        RETURN_NOT_OK(
+            chunked_buffer->internal_buffer_size(chunk_idx, &chunk_size));
+      }
+
+      // Sanity check we have sufficient space to perform our random access
+      // read of 'buffer'.
+      if (chunk_size < (chunk_offset + sizeof(T))) {
+        return Status::UtilsError(
+            "Out of bounds read to internal chunk buffer of size " +
+            std::to_string(chunk_size));
+      }
+
+      const T c =
+          *reinterpret_cast<T*>(static_cast<char*>(buffer) + chunk_offset);
+      chunk_offset += sizeof(T);
+
+      if (pos == 0) {
+        mbr[2 * d] = c;
+        mbr[2 * d + 1] = c;
+      } else {
+        utils::geometry::expand_mbr<T>(d, c, mbr);
+      }
+    }
+  }
 
   return Status::Ok();
 }
@@ -1170,7 +1222,7 @@ Status Writer::filter_tiles(
 
 Status Writer::filter_tile(
     const std::string& name, Tile* tile, bool offsets) const {
-  auto orig_size = tile->buffer()->size();
+  const auto orig_size = tile->chunked_buffer()->size();
 
   // Get a copy of the appropriate filter pipeline.
   FilterPipeline filters =
@@ -1250,8 +1302,9 @@ Status Writer::global_write() {
   assert(layout_ == Layout::GLOBAL_ORDER);
 
   // Initialize the global write state if this is the first invocation
-  if (!global_write_state_)
+  if (!global_write_state_) {
     RETURN_CANCEL_OR_ERROR(init_global_write_state());
+  }
   auto frag_meta = global_write_state_->frag_meta_.get();
   auto uri = frag_meta->fragment_uri();
 
@@ -1695,7 +1748,6 @@ Status Writer::prepare_full_tiles(
     auto buff_it = buffers_.begin();
     std::advance(buff_it, i);
     const auto& name = buff_it->first;
-
     RETURN_CANCEL_OR_ERROR(
         prepare_full_tiles(name, coord_dups, &(*tiles)[name]));
     return Status::Ok();
@@ -1748,9 +1800,10 @@ Status Writer::prepare_full_tiles_fixed(
       } while (!last_tile.full() && cell_idx != cell_num);
     } else {
       do {
-        if (coord_dups.find(cell_idx) == coord_dups.end())
+        if (coord_dups.find(cell_idx) == coord_dups.end()) {
           RETURN_NOT_OK(
               last_tile.write(buffer + cell_idx * cell_size, cell_size));
+        }
         ++cell_idx;
       } while (!last_tile.full() && cell_idx != cell_num);
     }
@@ -1847,6 +1900,7 @@ Status Writer::prepare_full_tiles_var(
   auto& last_tile_pair = global_write_state_->last_tiles_[name];
   auto& last_tile = last_tile_pair.first;
   auto& last_tile_var = last_tile_pair.second;
+
   uint64_t cell_idx = 0;
   if (!last_tile.empty()) {
     if (coord_dups.empty()) {
@@ -2021,37 +2075,39 @@ Status Writer::prepare_tiles(
       // Write empty range
       if (wcr.pos_ > pos) {
         if (var_size)
-          write_empty_cell_range_to_tile_var(
-              wcr.pos_ - pos, &(*tiles)[t], &(*tiles)[t + 1]);
+          RETURN_NOT_OK(write_empty_cell_range_to_tile_var(
+              wcr.pos_ - pos, &(*tiles)[t], &(*tiles)[t + 1]));
         else
-          write_empty_cell_range_to_tile(
-              (wcr.pos_ - pos) * cell_val_num, &(*tiles)[t]);
+          RETURN_NOT_OK(write_empty_cell_range_to_tile(
+              (wcr.pos_ - pos) * cell_val_num, &(*tiles)[t]));
         pos = wcr.pos_;
       }
 
       // Write (non-empty) range
-      if (var_size)
-        write_cell_range_to_tile_var(
+      if (var_size) {
+        RETURN_NOT_OK(write_cell_range_to_tile_var(
             buff.get(),
             buff_var.get(),
             wcr.start_,
             wcr.end_,
             &(*tiles)[t],
-            &(*tiles)[t + 1]);
-      else
-        write_cell_range_to_tile(
-            buff.get(), wcr.start_, wcr.end_, &(*tiles)[t]);
+            &(*tiles)[t + 1]));
+      } else {
+        RETURN_NOT_OK(write_cell_range_to_tile(
+            buff.get(), wcr.start_, wcr.end_, &(*tiles)[t]));
+      }
       pos += wcr.end_ - wcr.start_ + 1;
     }
 
     // Write empty range
     if (pos <= end_pos) {
-      if (var_size)
-        write_empty_cell_range_to_tile_var(
-            end_pos - pos + 1, &(*tiles)[t], &(*tiles)[t + 1]);
-      else
-        write_empty_cell_range_to_tile(
-            (end_pos - pos + 1) * cell_val_num, &(*tiles)[t]);
+      if (var_size) {
+        RETURN_NOT_OK(write_empty_cell_range_to_tile_var(
+            end_pos - pos + 1, &(*tiles)[t], &(*tiles)[t + 1]));
+      } else {
+        RETURN_NOT_OK(write_empty_cell_range_to_tile(
+            (end_pos - pos + 1) * cell_val_num, &(*tiles)[t]));
+      }
     }
   }
 
@@ -2460,22 +2516,90 @@ Status Writer::write_tiles(
   const auto& var_uri = var_size ? frag_meta->var_uri(name) : URI("");
 
   // Write tiles
-  auto tile_num = tiles.size();
-  for (size_t i = 0, tile_id = 0; i < tile_num; ++i, ++tile_id) {
-    RETURN_NOT_OK(storage_manager_->write(uri, tiles[i].buffer()));
-    frag_meta->set_tile_offset(name, tile_id, tiles[i].buffer()->size());
+  size_t i = 0;
+  size_t tile_id = 0;
+  const auto tile_num = tiles.size();
+  while (i < tile_num) {
+    const Tile* tile = &tiles[i++];
+    ChunkedBuffer* chunked_buffer = tile->chunked_buffer();
 
-    STATS_COUNTER_ADD(writer_num_bytes_written, tiles[i].buffer()->size());
+    size_t populated_nchunks = chunked_buffer->nchunks();
+    if (chunked_buffer->size() != chunked_buffer->capacity()) {
+      populated_nchunks = 0;
+      for (uint64_t i = 0; i < chunked_buffer->nchunks(); ++i) {
+        uint32_t chunk_buffer_size;
+        RETURN_NOT_OK(
+            chunked_buffer->internal_buffer_size(i, &chunk_buffer_size));
+        if (chunk_buffer_size == 0) {
+          break;
+        }
+        ++populated_nchunks;
+      }
+    }
+
+    RETURN_NOT_OK(storage_manager_->write(
+        uri, &populated_nchunks, sizeof(uint64_t)));
+    for (size_t n = 0; n < populated_nchunks; ++n) {
+      void* buffer;
+      uint32_t buffer_size;
+      RETURN_NOT_OK(chunked_buffer->internal_buffer(n, &buffer));
+      RETURN_NOT_OK(chunked_buffer->internal_buffer_size(n, &buffer_size));
+      if (buffer_size == 0) {
+        continue;
+      }
+
+      RETURN_NOT_OK(storage_manager_->write(uri, buffer, buffer_size));
+    }
+
+    frag_meta->set_tile_offset(
+        name, tile_id, sizeof(uint64_t) + chunked_buffer->size());
+
+    STATS_COUNTER_ADD(
+        writer_num_bytes_written, sizeof(uint64_t) + chunked_buffer->size());
 
     if (var_size) {
-      ++i;
+      tile = &tiles[i++];
+      chunked_buffer = tile->chunked_buffer();
 
-      RETURN_NOT_OK(storage_manager_->write(var_uri, tiles[i].buffer()));
-      frag_meta->set_tile_var_offset(name, tile_id, tiles[i].buffer()->size());
-      frag_meta->set_tile_var_size(name, tile_id, tiles[i].pre_filtered_size());
+      populated_nchunks = chunked_buffer->nchunks();
+      if (chunked_buffer->size() != chunked_buffer->capacity()) {
+        populated_nchunks = 0;
+        for (uint64_t i = 0; i < chunked_buffer->nchunks(); ++i) {
+          uint32_t chunk_buffer_size;
+          RETURN_NOT_OK(
+              chunked_buffer->internal_buffer_size(i, &chunk_buffer_size));
+          if (chunk_buffer_size == 0) {
+            break;
+          }
+          ++populated_nchunks;
+        }
+      }
 
-      STATS_COUNTER_ADD(writer_num_bytes_written, tiles[i].buffer()->size());
+      RETURN_NOT_OK(storage_manager_->write(
+          var_uri, &populated_nchunks, sizeof(uint64_t)));
+      for (size_t n = 0; n < populated_nchunks; ++n) {
+        void* buffer;
+        uint32_t buffer_size;
+        RETURN_NOT_OK(chunked_buffer->internal_buffer(n, &buffer));
+        RETURN_NOT_OK(chunked_buffer->internal_buffer_size(n, &buffer_size));
+        if (buffer_size == 0) {
+          continue;
+        }
+
+        RETURN_NOT_OK(
+            storage_manager_->write(var_uri, buffer, buffer_size));
+      }
+
+      frag_meta->set_tile_var_offset(
+          name, tile_id, sizeof(uint64_t) + chunked_buffer->size());
+      frag_meta->set_tile_var_size(
+          name, tile_id, tile->pre_filtered_size());
+
+      STATS_COUNTER_ADD(
+          writer_num_bytes_written, sizeof(uint64_t) + chunked_buffer->size());
     }
+
+    ++tile_id;
   }
 
   // Close files, except in the case of global order

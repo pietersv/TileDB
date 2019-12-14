@@ -140,7 +140,8 @@ class ResultTile {
   Status read(
       const std::string& name, void* buffer, uint64_t pos, uint64_t len);
 
- private:
+  // TODO JOE: public -> private
+ public:
   /** The array domain. */
   const Domain* domain_;
   /** The id of the fragment this tile belongs to. */
